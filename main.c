@@ -79,7 +79,7 @@ float fourier_knee_velocity(float t){
 
 float Duty_Val(float knee_velocity){
 	float two_pi = 2.0f * M_PI;
-	float duty_cycle = (267*knee_velocity*60/(two_pi*268*12));
+	float duty_cycle = (267*knee_velocity*60/(two_pi*268*12)*(M_PI / 180.0f));
 	return duty_cycle;
 
 }
