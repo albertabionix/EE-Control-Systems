@@ -1,0 +1,379 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : Main program body
+  ******************************************************************************
+  * @attention
+  *
+  * Copyright (c) 2026 STMicroelectronics.
+  * All rights reserved.
+  *
+  * This software is licensed under terms that can be found in the LICENSE file
+  * in the root directory of this software component.
+  * If no LICENSE file comes with this software, it is provided AS-IS.
+  *
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
+
+/* Private includes ----------------------------------------------------------*/
+/* USER CODE BEGIN Includes */
+#include <math.h>
+/* USER CODE END Includes */
+
+/* Private typedef -----------------------------------------------------------*/
+/* USER CODE BEGIN PTD */
+
+/* USER CODE END PTD */
+
+/* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+/* Wiring: PA9 (TIM1_CH2) -> driver P (speed PWM)
+           PA10 (TIM1_CH3) -> driver DIR
+           GND -> driver G                                                    */
+
+/* TIM1 counts 0..PWM_PERIOD. Clock is 4 MHz, so 4000 counts = 1 kHz PWM.
+   Must match htim1.Init.Period (= PWM_TOP - 1) in MX_TIM1_Init.              */
+#define PWM_TOP          4000U
+
+/* Motor and gearbox constants from the profile document */
+#define GEAR_RATIO       267.0f     /* motor turns per knee turn   */
+#define KV_RPM_PER_V     268.0f     /* maxon EC 90 flat 607321     */
+#define V_SUPPLY         12.0f
+
+/* Speed scale. At 1.0 the profile asks for about 4.9x the speed the motor
+   can reach on 12 V, so it must be scaled down.
+     0.20 = profile peak sits just under 100 % duty
+     0.05 = profile peak is about 25 % duty (first bench run)                 */
+#define SCALE            0.05f
+
+/* Hard ceiling on duty, 0..1. Applied after SCALE. */
+#define DUTY_MAX         1.0f
+
+/* Gait cycle length and update interval */
+#define GAIT_PERIOD_MS   1000U
+#define UPDATE_MS        10U        /* 100 Hz, as in the profile document */
+
+/* 1 = coefficients re-solved so f(t) passes through the four data points
+       (0.05,150) (0.25,-100) (0.60,300) (0.85,-350)
+   0 = original coefficients from the document                              */
+#define USE_CORRECTED_FIT 1
+/* USER CODE END PD */
+
+/* Private macro -------------------------------------------------------------*/
+/* USER CODE BEGIN PM */
+
+/* USER CODE END PM */
+
+/* Private variables ---------------------------------------------------------*/
+TIM_HandleTypeDef htim1;
+
+/* USER CODE BEGIN PV */
+
+/* USER CODE END PV */
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_TIM1_Init(void);
+/* USER CODE BEGIN PFP */
+float fourier_knee_velocity(float t);
+float Duty_Val(float knee_deg_s);
+/* USER CODE END PFP */
+
+/* Private user code ---------------------------------------------------------*/
+/* USER CODE BEGIN 0 */
+
+/* Knee angular velocity in deg/s. t is the fraction of the gait cycle, 0..1. */
+float fourier_knee_velocity(float t){
+    float two_pi  = 2.0f * (float)M_PI;
+    float four_pi = 4.0f * (float)M_PI;
+
+#if USE_CORRECTED_FIT
+    float term1 =  200.93f * sinf(four_pi * t);
+    float term2 =  154.01f * cosf(four_pi * t);
+    float term3 =   54.01f * sinf(two_pi  * t);
+    float term4 = -115.03f * cosf(two_pi  * t);
+#else
+    float term1 =  -47.75f * sinf(four_pi * t);
+    float term2 =  232.25f * cosf(four_pi * t);
+    float term3 =  147.57f * sinf(two_pi  * t);
+    float term4 =  -67.75f * cosf(two_pi  * t);
+#endif
+
+    return term1 + term2 + term3 + term4;
+}
+
+/* Signed duty, nominally -1..1, from knee speed in deg/s.
+   deg/s -> rpm is a divide by 6 (360 deg per rev, 60 s per min). */
+float Duty_Val(float knee_deg_s){
+    float knee_rpm  = knee_deg_s / 6.0f;
+    float motor_rpm = knee_rpm * GEAR_RATIO;
+    float duty      = SCALE * motor_rpm / (KV_RPM_PER_V * V_SUPPLY);
+    return duty;
+}
+
+/* USER CODE END 0 */
+
+/**
+  * @brief  The application entry point.
+  * @retval int
+  */
+int main(void)
+{
+  /* USER CODE BEGIN 1 */
+
+  /* USER CODE END 1 */
+
+  /* MCU Configuration--------------------------------------------------------*/
+
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+  HAL_Init();
+
+  /* USER CODE BEGIN Init */
+
+  /* USER CODE END Init */
+
+  /* Configure the system clock */
+  SystemClock_Config();
+
+  /* USER CODE BEGIN SysInit */
+
+  /* USER CODE END SysInit */
+
+  /* Initialize all configured peripherals */
+  MX_GPIO_Init();
+  MX_TIM1_Init();
+  /* USER CODE BEGIN 2 */
+
+  /* Start with zero speed and a defined direction before enabling outputs */
+  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, 0);
+  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, 0);
+  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2);   /* PA9  -> P   */
+  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3);   /* PA10 -> DIR */
+
+  uint32_t start_time = HAL_GetTick();
+
+  /* USER CODE END 2 */
+
+  /* Infinite loop */
+  /* USER CODE BEGIN WHILE */
+  while (1){
+    /* Position in the gait cycle, 0..1, repeating every GAIT_PERIOD_MS */
+    uint32_t elapsed = (HAL_GetTick() - start_time) % GAIT_PERIOD_MS;
+    float t = (float)elapsed / (float)GAIT_PERIOD_MS;
+
+    float knee_deg_s = fourier_knee_velocity(t);
+    float duty = Duty_Val(knee_deg_s);
+
+    /* Speed: magnitude only, limited to DUTY_MAX */
+    float duty_mag = fabsf(duty);
+    if (duty_mag > DUTY_MAX) duty_mag = DUTY_MAX;
+
+    uint32_t pulse = (uint32_t)(duty_mag * (float)PWM_TOP);
+    if (pulse > PWM_TOP) pulse = PWM_TOP;
+
+    /* Direction: PWM_TOP is above the timer period, so the pin stays high */
+    uint32_t dir = (knee_deg_s >= 0.0f) ? PWM_TOP : 0U;
+
+    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, dir);     /* PA10: DIR   */
+    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, pulse);   /* PA9 : speed */
+
+    HAL_Delay(UPDATE_MS);
+
+    /* USER CODE END WHILE */
+
+    /* USER CODE BEGIN 3 */
+  }
+  /* USER CODE END 3 */
+}
+
+/**
+  * @brief System Clock Configuration
+  * @retval None
+  */
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+  /** Configure the main internal regulator output voltage
+  */
+  if (HAL_PWREx_ControlVoltageScaling(PWR_REGULATOR_VOLTAGE_SCALE1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Initializes the RCC Oscillators according to the specified parameters
+  * in the RCC_OscInitTypeDef structure.
+  */
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_MSI;
+  RCC_OscInitStruct.MSIState = RCC_MSI_ON;
+  RCC_OscInitStruct.MSICalibrationValue = 0;
+  RCC_OscInitStruct.MSIClockRange = RCC_MSIRANGE_6;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_NONE;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Initializes the CPU, AHB and APB buses clocks
+  */
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_MSI;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_0) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
+  * @brief TIM1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM1_Init(void)
+{
+
+  /* USER CODE BEGIN TIM1_Init 0 */
+
+  /* USER CODE END TIM1_Init 0 */
+
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+  TIM_OC_InitTypeDef sConfigOC = {0};
+  TIM_BreakDeadTimeConfigTypeDef sBreakDeadTimeConfig = {0};
+
+  /* USER CODE BEGIN TIM1_Init 1 */
+
+  /* USER CODE END TIM1_Init 1 */
+  htim1.Instance = TIM1;
+  htim1.Init.Prescaler = 0;
+  htim1.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim1.Init.Period = 3999;
+  htim1.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim1.Init.RepetitionCounter = 0;
+  htim1.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim1, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_PWM_Init(&htim1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterOutputTrigger2 = TIM_TRGO2_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim1, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sConfigOC.OCMode = TIM_OCMODE_PWM1;
+  sConfigOC.Pulse = 0;
+  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+  sConfigOC.OCNPolarity = TIM_OCNPOLARITY_HIGH;
+  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+  sConfigOC.OCIdleState = TIM_OCIDLESTATE_RESET;
+  sConfigOC.OCNIdleState = TIM_OCNIDLESTATE_RESET;
+  if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sBreakDeadTimeConfig.OffStateRunMode = TIM_OSSR_DISABLE;
+  sBreakDeadTimeConfig.OffStateIDLEMode = TIM_OSSI_DISABLE;
+  sBreakDeadTimeConfig.LockLevel = TIM_LOCKLEVEL_OFF;
+  sBreakDeadTimeConfig.DeadTime = 0;
+  sBreakDeadTimeConfig.BreakState = TIM_BREAK_DISABLE;
+  sBreakDeadTimeConfig.BreakPolarity = TIM_BREAKPOLARITY_HIGH;
+  sBreakDeadTimeConfig.BreakFilter = 0;
+  sBreakDeadTimeConfig.Break2State = TIM_BREAK2_DISABLE;
+  sBreakDeadTimeConfig.Break2Polarity = TIM_BREAK2POLARITY_HIGH;
+  sBreakDeadTimeConfig.Break2Filter = 0;
+  sBreakDeadTimeConfig.AutomaticOutput = TIM_AUTOMATICOUTPUT_DISABLE;
+  if (HAL_TIMEx_ConfigBreakDeadTime(&htim1, &sBreakDeadTimeConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM1_Init 2 */
+
+  /* USER CODE END TIM1_Init 2 */
+  HAL_TIM_MspPostInit(&htim1);
+
+}
+
+/**
+  * @brief GPIO Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_GPIO_Init(void)
+{
+/* USER CODE BEGIN MX_GPIO_Init_1 */
+
+/* USER CODE END MX_GPIO_Init_1 */
+
+  /* GPIO Ports Clock Enable */
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+
+/* USER CODE BEGIN MX_GPIO_Init_2 */
+
+/* USER CODE END MX_GPIO_Init_2 */
+}
+
+/* USER CODE BEGIN 4 */
+
+/* USER CODE END 4 */
+
+/**
+  * @brief  This function is executed in case of error occurrence.
+  * @retval None
+  */
+void Error_Handler(void)
+{
+  /* USER CODE BEGIN Error_Handler_Debug */
+  /* User can add his own implementation to report the HAL error return state */
+  __disable_irq();
+  while (1)
+  {
+  }
+  /* USER CODE END Error_Handler_Debug */
+}
+
+#ifdef  USE_FULL_ASSERT
+/**
+  * @brief  Reports the name of the source file and the source line number
+  *         where the assert_param error has occurred.
+  * @param  file: pointer to the source file name
+  * @param  line: assert_param error line source number
+  * @retval None
+  */
+void assert_failed(uint8_t *file, uint32_t line)
+{
+  /* USER CODE BEGIN 6 */
+  /* User can add his own implementation to report the file name and line number,
+     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
+  /* USER CODE END 6 */
+}
+#endif /* USE_FULL_ASSERT */
